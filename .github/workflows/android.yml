@@ -1,0 +1,269 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 17
+
+    # ========================================
+    # Install Obfuscapk dependencies
+    # ========================================
+    - name: Install Obfuscapk dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-pip python3-venv openjdk-17-jdk
+        python3 -m pip install --upgrade pip
+        
+        # Clone Obfuscapk
+        git clone https://github.com/ClaudiuGeorgiu/Obfuscapk.git
+        cd Obfuscapk/src
+        pip3 install -r requirements.txt
+        echo "Obfuscapk installed successfully"
+
+    - name: Read build configuration
+      id: config
+      run: |
+        files=$(jq -r '.files // "repo"' info.json)
+        isDebugBuild=$(jq -r '.isDebugBuild' info.json)
+        isReleaseBuild=$(jq -r '.isReleaseBuild' info.json)
+        
+        echo "files=$files" >> $GITHUB_OUTPUT
+        echo "isDebugBuild=$isDebugBuild" >> $GITHUB_OUTPUT
+        echo "isReleaseBuild=$isReleaseBuild" >> $GITHUB_OUTPUT
+        
+        if [ "$isReleaseBuild" = "true" ]; then
+          keystorePath=$(jq -r '.keystore.path' info.json)
+          keystoreAlias=$(jq -r '.keystore."keystore-alis"' info.json)
+          keystorePassword=$(jq -r '.keystore."keystore-password"' info.json)
+          
+          echo "keystorePath=$keystorePath" >> $GITHUB_OUTPUT
+          echo "keystoreAlias=$keystoreAlias" >> $GITHUB_OUTPUT
+          echo "keystorePassword=$keystorePassword" >> $GITHUB_OUTPUT
+          
+          v1=$(jq -r '.signature.V1 // false' info.json)
+          v2=$(jq -r '.signature.V2 // false' info.json)
+          v3=$(jq -r '.signature.V3 // false' info.json)
+          
+          echo "v1SigningEnabled=$v1" >> $GITHUB_OUTPUT
+          echo "v2SigningEnabled=$v2" >> $GITHUB_OUTPUT
+          echo "v3SigningEnabled=$v3" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Prepare project files
+      if: steps.config.outputs.files == 'release'
+      run: |
+        echo "Downloading project.zip from release 'files'..."
+
+        # Get release info from the private repo using the tag "files"
+        RELEASE_JSON=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          https://api.github.com/repos/${{ github.repository }}/releases/tags/files)
+
+        # Get the download URL for project.zip
+        DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name=="project.zip") | .url')
+
+        if [ -z "$DOWNLOAD_URL" ]; then
+          echo "project.zip not found in release 'files'"
+          exit 1
+        fi
+
+        # Download project.zip with authentication
+        curl -L -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+             -H "Accept: application/octet-stream" \
+             -o project.zip "$DOWNLOAD_URL"
+
+        echo "Extracting project.zip..."
+        unzip -o project.zip -d .
+
+    - name: Check if any build is enabled
+      run: |
+        if [ "${{ steps.config.outputs.isDebugBuild }}" = "false" ] && [ "${{ steps.config.outputs.isReleaseBuild }}" = "false" ]; then
+          echo "No builds enabled. Exiting."
+          exit 0
+        fi
+
+    - name: Make gradlew executable
+      run: chmod +x gradlew
+
+    - name: Cache Gradle
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+        key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+        restore-keys: |
+          gradle-${{ runner.os }}-
+
+    - name: Setup keystore for release build
+      if: steps.config.outputs.isReleaseBuild == 'true'
+      run: |
+        KEYSTORE_PATH="${{ steps.config.outputs.keystorePath }}"
+        if [ ! -f "$KEYSTORE_PATH" ]; then
+          echo "Keystore not found at $KEYSTORE_PATH"
+          exit 1
+        fi
+        echo "KEYSTORE_PATH=$KEYSTORE_PATH" >> $GITHUB_ENV
+        echo "KEY_ALIAS=${{ steps.config.outputs.keystoreAlias }}" >> $GITHUB_ENV
+        echo "KEYSTORE_PASSWORD=${{ steps.config.outputs.keystorePassword }}" >> $GITHUB_ENV
+        echo "KEY_PASSWORD=${{ steps.config.outputs.keystorePassword }}" >> $GITHUB_ENV
+
+    - name: Update release signing config with signature versions
+      if: steps.config.outputs.isReleaseBuild == 'true'
+      run: |
+        sed -i "/signingConfigs {/,/^    }/ {
+          s/enableV1Signing = .*/enableV1Signing = ${{ steps.config.outputs.v1SigningEnabled }}/
+          s/enableV2Signing = .*/enableV2Signing = ${{ steps.config.outputs.v2SigningEnabled }}/
+          s/enableV3Signing = .*/enableV3Signing = ${{ steps.config.outputs.v3SigningEnabled }}/
+        }" app/build.gradle
+        echo "Updated release signature versions in build.gradle"
+
+    - name: Build Debug APK
+      if: steps.config.outputs.isDebugBuild == 'true'
+      continue-on-error: true
+      run: |
+        ./gradlew assembleDebug 2>&1 | tee debug-build.log
+        if [ -f "app/build/outputs/apk/debug/app-debug.apk" ]; then
+          echo "Debug APK built successfully"
+        else
+          echo "Debug APK build failed"
+          exit 1
+        fi
+
+    - name: Build Release APK & AAB
+      if: steps.config.outputs.isReleaseBuild == 'true'
+      continue-on-error: true
+      run: |
+        ./gradlew assembleRelease bundleRelease 2>&1 | tee release-build.log
+        
+        # Debug: List files to see what was built
+        echo "=== Files in app/build/outputs/apk/release/ ==="
+        ls -la app/build/outputs/apk/release/ || echo "Directory not found"
+        echo "=== Files in app/build/outputs/bundle/release/ ==="
+        ls -la app/build/outputs/bundle/release/ || echo "Directory not found"
+        
+        if [ -f "app/build/outputs/apk/release/app-release.apk" ] && [ -f "app/build/outputs/bundle/release/app-release.aab" ]; then
+          echo "Release APK and AAB built successfully"
+        else
+          echo "Release build failed"
+          exit 1
+        fi
+
+    # ========================================
+    # FIXED: Obfuscate Release APK with Obfuscapk
+    # ========================================
+    - name: Obfuscate Release APK with Obfuscapk
+      if: steps.config.outputs.isReleaseBuild == 'true'
+      run: |
+        echo "Starting Obfuscapk obfuscation..."
+        
+        # FIRST: Verify the APK exists
+        echo "Checking for APK..."
+        ls -la app/build/outputs/apk/release/
+        
+        # Copy APK to a known location (outside the Obfuscapk directory)
+        # Use absolute paths to avoid confusion
+        APK_PATH="$(pwd)/app/build/outputs/apk/release/app-release.apk"
+        echo "APK_PATH: $APK_PATH"
+        
+        if [ ! -f "$APK_PATH" ]; then
+          echo "ERROR: APK not found at $APK_PATH"
+          exit 1
+        fi
+        
+        # Create a working directory for Obfuscapk
+        mkdir -p obfuscapk_work
+        cp "$APK_PATH" obfuscapk_work/app-release.apk
+        
+        echo "APK copied to obfuscapk_work/app-release.apk"
+        
+        # Run Obfuscapk from its source directory
+        cd Obfuscapk/src
+        
+        echo "Running Obfuscapk..."
+        python3 -m obfuscapk.cli \
+          -o ClassRename \
+          -o FieldRename \
+          -o ConstStringEncryption \
+          -o Rebuild \
+          -o NewAlignment \
+          -o NewSignature \
+          -p ../obfuscapk_work/app-release.apk \
+          -d ../obfuscapk_work/obfuscated \
+          --keystore "$KEYSTORE_PATH" \
+          --keystore-password "$KEYSTORE_PASSWORD" \
+          --key-alias "$KEY_ALIAS" \
+          --key-password "$KEY_PASSWORD" \
+          -v  # Verbose output to see what's happening
+        
+        # Go back to root
+        cd ..
+        
+        # Check if obfuscation was successful
+        echo "Checking for obfuscated APK..."
+        ls -la obfuscapk_work/obfuscated/ || echo "Obfuscated directory not found"
+        
+        if [ -f "obfuscapk_work/obfuscated/app-release-obfuscated.apk" ]; then
+          echo "Obfuscation successful!"
+          # Copy to the original location for upload
+          cp obfuscapk_work/obfuscated/app-release-obfuscated.apk app/build/outputs/apk/release/app-release-obfuscated.apk
+          
+          # Also copy mapping file if it exists
+          if [ -f "obfuscapk_work/obfuscated/app-release-mapping.txt" ]; then
+            cp obfuscapk_work/obfuscated/app-release-mapping.txt obfuscapk_work/
+            echo "Mapping file saved"
+          fi
+        else
+          echo "Obfuscation failed - keeping original APK"
+          # Create a dummy obfuscated APK (just copy original) so the upload doesn't fail
+          cp app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/app-release-obfuscated.apk
+          echo "WARNING: Obfuscation failed, using original APK as fallback"
+          exit 1
+        fi
+
+    - name: Upload Debug APK
+      if: always() && steps.config.outputs.isDebugBuild == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: debug-apk
+        path: app/build/outputs/apk/debug/app-debug.apk
+        retention-days: 30
+
+    - name: Upload Release APK (Original & Obfuscated)
+      if: always() && steps.config.outputs.isReleaseBuild == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-builds
+        path: |
+          app/build/outputs/apk/release/app-release.apk
+          app/build/outputs/apk/release/app-release-obfuscated.apk
+          app/build/outputs/bundle/release/app-release.aab
+        retention-days: 30
+    
+    # ========================================
+    # Upload Obfuscation Mapping File
+    # ========================================
+    - name: Upload Mapping File
+      if: always() && steps.config.outputs.isReleaseBuild == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: obfuscation-mapping
+        path: |
+          obfuscapk_work/*-mapping.txt
+          obfuscapk_work/obfuscated/*-mapping.txt
+        retention-days: 90
+        continue-on-error: true  # Don't fail if mapping file doesn't exist
