@@ -1,0 +1,19 @@
+{
+  "files": "release",
+  "isDebugBuild": false,
+  "isReleaseBuild": true,
+  "keystore": {
+    "path": "keystore.jks",
+    "keystore-alis": "zxx-coder",
+    "keystore-password": "Sn[s))9)#@adfghI"
+  },
+  "info": {
+    "package-name": "com.example.myapp",
+    "app-name": "My App"
+  },
+  "signature": {
+    "V1": true,
+    "V2": true,
+    "V3": true
+  }
+}
